@@ -83,11 +83,11 @@ public class DiscountsInvoicePluginApi extends PluginInvoicePluginApi {
 
         final List<InvoiceItem> items = invoice.getInvoiceItems();
 
-        if (items.stream().noneMatch(item -> item.getInvoiceItemType() == InvoiceItemType.RECURRING)) {
+        if (items.stream().noneMatch(item -> item.getInvoiceItemType() == InvoiceItemType.RECURRING || item.getInvoiceItemType() == InvoiceItemType.REPAIR_ADJ)) {
             return List.of();
         }
         // applied once per invoice
-        if (items.stream().anyMatch(item -> item.getInvoiceItemType() == InvoiceItemType.CREDIT_ADJ && isOurs(item))) {
+        if (items.stream().anyMatch(item -> (item.getInvoiceItemType() == InvoiceItemType.CREDIT_ADJ || item.getInvoiceItemType() == InvoiceItemType.EXTERNAL_CHARGE) && isOurs(item))) {
             return List.of();
         }
 
@@ -96,19 +96,23 @@ public class DiscountsInvoicePluginApi extends PluginInvoicePluginApi {
                                             .filter(item -> item.getInvoiceItemType() == InvoiceItemType.RECURRING || item.getInvoiceItemType() == InvoiceItemType.REPAIR_ADJ)
                                             .filter(item -> !"app_monthly".equals(catalogPlan(item.getPlanName())))
                                             .collect(Collectors.toList());
-        BigDecimal total = round(base.stream().map(InvoiceItem::getAmount).reduce(BigDecimal.ZERO, BigDecimal::add));
-        if (total.signum() <= 0) {
+        final BigDecimal billed = round(base.stream().map(InvoiceItem::getAmount).reduce(BigDecimal.ZERO, BigDecimal::add));
+        if (billed.signum() == 0) {
             return List.of();
         }
+        // a credit (a removed addon, an undone upgrade) gives back what was paid: the percentages that discounted
+        // the charge reduce the credit the same way. a fixed amount only ever discounts a full-period charge
+        final boolean refund = billed.signum() < 0;
+        BigDecimal total = billed.abs();
 
         final Discounts discounts = discounts(invoice, context);
 
         final List<InvoiceItem> result = new ArrayList<>();
 
-        if (discounts.type != null && applies(discounts, items, invoice.getInvoiceDate())) {
+        if (discounts.type != null && (!refund || "percentage".equals(discounts.type)) && applies(discounts, items, invoice.getInvoiceDate())) {
             final BigDecimal amount = calculate(discounts.type, discounts.value, total);
             if (amount.signum() > 0) {
-                result.add(credit(invoice, base.get(0), amount, DISCOUNT));
+                result.add(line(invoice, base.get(0), amount, DISCOUNT, refund));
                 total = round(total.subtract(amount));
             }
         }
@@ -116,14 +120,18 @@ public class DiscountsInvoicePluginApi extends PluginInvoicePluginApi {
         if (discounts.affiliate != null) {
             final BigDecimal amount = calculate("percentage", discounts.affiliate, total);
             if (amount.signum() > 0) {
-                result.add(credit(invoice, base.get(0), amount, AFFILIATE + " (" + discounts.affiliate.stripTrailingZeros().toPlainString() + "%)"));
+                result.add(line(invoice, base.get(0), amount, AFFILIATE + " (" + discounts.affiliate.stripTrailingZeros().toPlainString() + "%)", refund));
             }
         }
 
         return result;
     }
 
-    private static InvoiceItem credit(final Invoice invoice, final InvoiceItem template, final BigDecimal amount, final String description) {
+    // a discount on a charge is a credit; on a credit it takes the same share back, as a charge
+    private static InvoiceItem line(final Invoice invoice, final InvoiceItem template, final BigDecimal amount, final String description, final boolean refund) {
+        if (refund) {
+            return PluginInvoiceItem.create(template, invoice.getId(), invoice.getInvoiceDate(), null, amount, description, InvoiceItemType.EXTERNAL_CHARGE);
+        }
         return PluginInvoiceItem.create(template, invoice.getId(), invoice.getInvoiceDate(), null, amount.negate(), description, InvoiceItemType.CREDIT_ADJ);
     }
 
